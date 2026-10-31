@@ -1,4 +1,3 @@
-
 #!/bin/bash
 
 red='\033[0;31m'
@@ -6,7 +5,6 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-#Add some basic function here
 function LOGD() {
     echo -e "${yellow}[DEG] $* ${plain}"
 }
@@ -18,10 +16,9 @@ function LOGE() {
 function LOGI() {
     echo -e "${green}[INF] $* ${plain}"
 }
-# check root
+
 [[ $EUID -ne 0 ]] && LOGE "ERROR: You must be root to run this script! \n" && exit 1
 
-# Check OS and set release variable
 if [[ -f /etc/os-release ]]; then
     source /etc/os-release
     release=$ID
@@ -35,29 +32,25 @@ fi
 
 echo "The OS release is: $release"
 
-
-os_version=""
-os_version=$(grep -i version_id /etc/os-release | cut -d \" -f2 | cut -d . -f1)
-
-if [[ "${release}" == "centos" ]]; then
-    if [[ ${os_version} -lt 8 ]]; then
-        echo -e "${red} Please use CentOS 8 or higher ${plain}\n" && exit 1
-    fi
-elif [[ "${release}" ==  "ubuntu" ]]; then
-    if [[ ${os_version} -lt 20 ]]; then
-        echo -e "${red}please use Ubuntu 20 or higher version! ${plain}\n" && exit 1
-    fi
-
-elif [[ "${release}" == "fedora" ]]; then
-    if [[ ${os_version} -lt 36 ]]; then
-        echo -e "${red}please use Fedora 36 or higher version! ${plain}\n" && exit 1
-    fi
-
-elif [[ "${release}" == "debian" ]]; then
-    if [[ ${os_version} -lt 10 ]]; then
-        echo -e "${red} Please use Debian 10 or higher ${plain}\n" && exit 1
-    fi
+# Detect the init system (systemd vs OpenRC used by Alpine)
+if [[ "$release" == "alpine" ]]; then
+    init_system="openrc"
+elif command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    init_system="systemd"
+elif command -v rc-service >/dev/null 2>&1; then
+    init_system="openrc"
+else
+    init_system="systemd"
 fi
+
+# Service wrappers so the menu works on both systemd and OpenRC (Alpine).
+svc_start()   { if [[ "${init_system}" == "openrc" ]]; then rc-service "$1" start; else systemctl start "$1"; fi; }
+svc_stop()    { if [[ "${init_system}" == "openrc" ]]; then rc-service "$1" stop; else systemctl stop "$1"; fi; }
+svc_restart() { if [[ "${init_system}" == "openrc" ]]; then rc-service "$1" restart; else systemctl restart "$1"; fi; }
+svc_status()  { if [[ "${init_system}" == "openrc" ]]; then rc-service "$1" status; else systemctl status "$1" -l; fi; }
+svc_enable()  { if [[ "${init_system}" == "openrc" ]]; then rc-update add "$1" default; else systemctl enable "$1"; fi; }
+svc_disable() { if [[ "${init_system}" == "openrc" ]]; then rc-update del "$1" default; else systemctl disable "$1"; fi; }
+svc_log()     { if [[ "${init_system}" == "openrc" ]]; then tail -n 200 -f /var/log/s-ui.log; else journalctl -u "$1".service -e --no-pager -f; fi; }
 
 confirm() {
     if [[ $# > 1 ]]; then
@@ -125,9 +118,8 @@ custom_version() {
     exit 1
     fi
 
-    download_link="https://raw.githubusercontent.com/alireza0/s-ui/master/install.sh"
+    download_link="https://raw.githubusercontent.com/alireza0/s-ui/main/install.sh"
 
-    # Use the entered panel version in the download link
     install_command="bash <(curl -Ls $download_link) $panel_version"
 
     echo "Downloading and installing panel version $panel_version..."
@@ -135,20 +127,24 @@ custom_version() {
 }
 
 uninstall() {
-    confirm "Are you sure you want to uninstall the panel? sing-box will also uninstalled!" "n"
+    confirm "Are you sure you want to uninstall the panel?" "n"
     if [[ $? != 0 ]]; then
         if [[ $# == 0 ]]; then
             show_menu
         fi
         return 0
     fi
-    systemctl stop s-ui
-    systemctl disable s-ui
-    systemctl stop sing-box
-    systemctl disable sing-box
-    rm /etc/systemd/system/s-ui.service -f
-    systemctl daemon-reload
-    systemctl reset-failed
+    if [[ "${init_system}" == "openrc" ]]; then
+        rc-service s-ui stop
+        rc-update del s-ui default
+        rm /etc/init.d/s-ui -f
+    else
+        systemctl stop s-ui
+        systemctl disable s-ui
+        rm /etc/systemd/system/s-ui.service -f
+        systemctl daemon-reload
+        systemctl reset-failed
+    fi
     rm /etc/s-ui/ -rf
     rm /usr/local/s-ui/ -rf
 
@@ -197,13 +193,11 @@ set_setting() {
     echo -e "Enter the ${yellow}panel path${plain} (leave blank for existing/default value):"
     read config_path
 
-    # Sub configuration
     echo -e "Enter the ${yellow}subscription port${plain} (leave blank for existing/default value):"
     read config_subPort
     echo -e "Enter the ${yellow}subscription path${plain} (leave blank for existing/default value):" 
     read config_subPath
 
-    # Set configs
     echo -e "${yellow}Initializing, please wait...${plain}"
     params=""
     [ -z "$config_port" ] || params="$params -port $config_port"
@@ -216,7 +210,18 @@ set_setting() {
 
 view_setting() {
     /usr/local/s-ui/sui setting -show
+    view_uri
     before_show_menu
+}
+
+view_uri() {
+    info=$(/usr/local/s-ui/sui uri)
+    if [[ $? != 0 ]]; then
+        LOGE "Get current uri error"
+        before_show_menu
+    fi
+    LOGI "You may access the Panel with following URL(s):"
+    echo -e "${green}${info}${plain}"
 }
 
 start() {
@@ -225,7 +230,7 @@ start() {
         echo ""
         LOGI -e "${1} is running, No need to start again, If you need to restart, please select restart"
     else
-        systemctl start $1
+        svc_start $1
         sleep 2
         check_status $1
         if [[ $? == 0 ]]; then
@@ -246,13 +251,13 @@ stop() {
         echo ""
         LOGI "${1} stopped, No need to stop again!"
     else
-        systemctl stop $1
+        svc_stop $1
         sleep 2
         check_status
         if [[ $? == 1 ]]; then
             LOGI "${1} stopped successfully"
         else
-            LOGE "Falied to stop ${1}, Probably because the stop time exceeds two seconds, Please check the log information later"
+            LOGE "Failed to stop ${1}, Probably because the stop time exceeds two seconds, Please check the log information later"
         fi
     fi
 
@@ -262,7 +267,7 @@ stop() {
 }
 
 restart() {
-    systemctl restart $1
+    svc_restart $1
     sleep 2
     check_status $1
     if [[ $? == 0 ]]; then
@@ -276,15 +281,14 @@ restart() {
 }
 
 status() {
-    systemctl status s-ui -l
-    systemctl status sing-box -l
+    svc_status s-ui
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
 }
 
 enable() {
-    systemctl enable $1
+    svc_enable $1
     if [[ $? == 0 ]]; then
         LOGI "Set ${1} to boot automatically on startup successfully"
     else
@@ -297,7 +301,7 @@ enable() {
 }
 
 disable() {
-    systemctl disable $1
+    svc_disable $1
     if [[ $? == 0 ]]; then
         LOGI "Autostart ${1} Cancelled successfully"
     else
@@ -310,14 +314,16 @@ disable() {
 }
 
 show_log() {
-    journalctl -u $1.service -e --no-pager -f
+    svc_log $1
     if [[ $# == 1 ]]; then
         before_show_menu
     fi
 }
 
 update_shell() {
-    wget -O /usr/bin/s-ui -N --no-check-certificate https://github.com/alireza0/s-ui/raw/main/s-ui.sh
+    # Certificate verification stays on: this file is about to be installed as
+    # /usr/bin/s-ui and run as root.
+    wget -O /usr/bin/s-ui -N https://github.com/alireza0/s-ui/raw/main/s-ui.sh
     if [[ $? != 0 ]]; then
         echo ""
         LOGE "Failed to download script, Please check whether the machine can connect Github"
@@ -328,8 +334,17 @@ update_shell() {
     fi
 }
 
-# 0: running, 1: not running, 2: not installed
 check_status() {
+    if [[ "${init_system}" == "openrc" ]]; then
+        if [[ ! -f "/etc/init.d/$1" ]]; then
+            return 2
+        fi
+        if rc-service "$1" status >/dev/null 2>&1; then
+            return 0
+        else
+            return 1
+        fi
+    fi
     if [[ ! -f "/etc/systemd/system/$1.service" ]]; then
         return 2
     fi
@@ -342,6 +357,13 @@ check_status() {
 }
 
 check_enabled() {
+    if [[ "${init_system}" == "openrc" ]]; then
+        if rc-update show default 2>/dev/null | grep -qw "$1"; then
+            return 0
+        else
+            return 1
+        fi
+    fi
     temp=$(systemctl is-enabled $1)
     if [[ x"${temp}" == x"enabled" ]]; then
         return 0
@@ -398,9 +420,9 @@ show_status() {
 show_enable_status() {
     check_enabled $1
     if [[ $? == 0 ]]; then
-        echo -e "Start automatically: ${green}Yes${plain}"
+        echo -e "Start ${1} automatically: ${green}Yes${plain}"
     else
-        echo -e "Start automatically: ${red}No${plain}"
+        echo -e "Start ${1} automatically: ${red}No${plain}"
     fi
 }
 
@@ -442,20 +464,13 @@ bbr_menu() {
 }
 
 disable_bbr() {
-
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
         echo -e "${yellow}BBR is not currently enabled.${plain}"
         exit 0
     fi
-
-    # Replace BBR with CUBIC configurations
     sed -i 's/net.core.default_qdisc=fq/net.core.default_qdisc=pfifo_fast/' /etc/sysctl.conf
     sed -i 's/net.ipv4.tcp_congestion_control=bbr/net.ipv4.tcp_congestion_control=cubic/' /etc/sysctl.conf
-
-    # Apply changes
     sysctl -p
-
-    # Verify that BBR is replaced with CUBIC
     if [[ $(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}') == "cubic" ]]; then
         echo -e "${green}BBR has been replaced with CUBIC successfully.${plain}"
     else
@@ -468,32 +483,30 @@ enable_bbr() {
         echo -e "${green}BBR is already enabled!${plain}"
         exit 0
     fi
-
-    # Check the OS and install necessary packages
     case "${release}" in
-    ubuntu | debian)
+    ubuntu | debian | armbian)
         apt-get update && apt-get install -yqq --no-install-recommends ca-certificates
         ;;
-    centos | almalinux | rocky)
+    centos | almalinux | rocky | oracle)
         yum -y update && yum -y install ca-certificates
         ;;
     fedora)
         dnf -y update && dnf -y install ca-certificates
+        ;;
+    arch | manjaro | parch)
+        pacman -Sy --noconfirm ca-certificates
+        ;;
+    alpine)
+        apk update && apk add --no-cache ca-certificates
         ;;
     *)
         echo -e "${red}Unsupported operating system. Please check the script and install the necessary packages manually.${plain}\n"
         exit 1
         ;;
     esac
-
-    # Enable BBR
     echo "net.core.default_qdisc=fq" | tee -a /etc/sysctl.conf
     echo "net.ipv4.tcp_congestion_control=bbr" | tee -a /etc/sysctl.conf
-
-    # Apply changes
     sysctl -p
-
-    # Verify that BBR is enabled
     if [[ $(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}') == "bbr" ]]; then
         echo -e "${green}BBR has been enabled successfully.${plain}"
     else
@@ -514,10 +527,22 @@ install_acme() {
     return 0
 }
 
+# secure_cert_files makes a certificate directory readable by its owner only.
+# These files were chmod 755, which left the private key world readable on a
+# multi-user host -- anyone able to read it can impersonate the panel.
+secure_cert_files() {
+    local dir="$1"
+    [ -n "$dir" ] && [ -d "$dir" ] || return 0
+    chmod 700 "$dir"
+    find "$dir" -type f -name '*.pem' -exec chmod 600 {} +
+    find "$dir" -type f ! -name '*.pem' -exec chmod 644 {} +
+}
+
 ssl_cert_issue_main() {
     echo -e "${green}\t1.${plain} Get SSL"
     echo -e "${green}\t2.${plain} Revoke"
     echo -e "${green}\t3.${plain} Force Renew"
+    echo -e "${green}\t4.${plain} Self-signed Certificate"
     read -p "Choose an option: " choice
     case "$choice" in
         1) ssl_cert_issue ;;
@@ -531,12 +556,14 @@ ssl_cert_issue_main() {
             local domain=""
             read -p "Please enter your domain name to forcefully renew an SSL certificate: " domain
             ~/.acme.sh/acme.sh --renew -d ${domain} --force ;;
+        4)
+            generate_self_signed_cert
+            ;;
         *) echo "Invalid choice" ;;
     esac
 }
 
 ssl_cert_issue() {
-    # check for acme.sh first
     if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
         echo "acme.sh could not be found. we will install it"
         install_acme
@@ -545,17 +572,26 @@ ssl_cert_issue() {
             exit 1
         fi
     fi
-    # install socat second
     case "${release}" in
-        ubuntu|debian)
-            apt update && apt install socat -y ;;
-        centos)
-            yum -y update && yum -y install socat ;;
-        fedora)
-            dnf -y update && dnf -y install socat ;;
-        *)
-            echo -e "${red}Unsupported operating system. Please check the script and install the necessary packages manually.${plain}\n"
-            exit 1 ;;
+    ubuntu | debian | armbian)
+        apt update && apt install socat -y
+        ;;
+    centos | almalinux | rocky | oracle)
+        yum -y update && yum -y install socat
+        ;;
+    fedora)
+        dnf -y update && dnf -y install socat
+        ;;
+    arch | manjaro | parch)
+        pacman -Sy --noconfirm socat
+        ;;
+    alpine)
+        apk update && apk add --no-cache socat
+        ;;
+    *)
+        echo -e "${red}Unsupported operating system. Please check the script and install the necessary packages manually.${plain}\n"
+        exit 1
+        ;;
     esac
     if [ $? -ne 0 ]; then
         LOGE "install socat failed, please check logs"
@@ -564,11 +600,9 @@ ssl_cert_issue() {
         LOGI "install socat succeed..."
     fi
 
-    # get the domain here,and we need verify it
     local domain=""
     read -p "Please enter your domain name:" domain
     LOGD "your domain is:${domain},check it..."
-    # here we need to judge whether there exists cert already
     local currentCert=$(~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}')
 
     if [ ${currentCert} == ${domain} ]; then
@@ -580,7 +614,6 @@ ssl_cert_issue() {
         LOGI "your domain is ready for issuing cert now..."
     fi
 
-    # create a directory for install cert
     certPath="/root/cert/${domain}"
     if [ ! -d "$certPath" ]; then
         mkdir -p "$certPath"
@@ -589,32 +622,33 @@ ssl_cert_issue() {
         mkdir -p "$certPath"
     fi
 
-    # get needed port here
     local WebPort=80
-    read -p "please choose which port do you use,default will be 80 port:" WebPort
-    if [[ ${WebPort} -gt 65535 || ${WebPort} -lt 1 ]]; then
+    read -r -p "please choose which port do you use,default will be 80 port:" WebPort
+    # A non-numeric answer used to make the arithmetic comparison an error and
+    # then be passed to acme.sh anyway. Anything that is not a port falls back.
+    if ! [[ "${WebPort}" =~ ^[0-9]+$ ]] || [ "${WebPort}" -lt 1 ] || [ "${WebPort}" -gt 65535 ]; then
         LOGE "your input ${WebPort} is invalid,will use default port"
+        WebPort=80
     fi
     LOGI "will use port:${WebPort} to issue certs,please make sure this port is open..."
-    # NOTE:This should be handled by user
-    # open the port and kill the occupied progress
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
     ~/.acme.sh/acme.sh --issue -d ${domain} --standalone --httpport ${WebPort}
     if [ $? -ne 0 ]; then
         LOGE "issue certs failed,please check logs"
-        rm -rf ~/.acme.sh/${domain}
+        # Guarded: with domain empty this expanded to ~/.acme.sh/ and took the
+        # whole acme.sh installation, including every other certificate.
+        [ -n "${domain}" ] && rm -rf ~/.acme.sh/"${domain}"
         exit 1
     else
         LOGE "issue certs succeed,installing certs..."
     fi
-    # install cert
     ~/.acme.sh/acme.sh --installcert -d ${domain} \
         --key-file /root/cert/${domain}/privkey.pem \
         --fullchain-file /root/cert/${domain}/fullchain.pem
 
     if [ $? -ne 0 ]; then
         LOGE "install certs failed,exit"
-        rm -rf ~/.acme.sh/${domain}
+        [ -n "${domain}" ] && rm -rf ~/.acme.sh/"${domain}"
         exit 1
     else
         LOGI "install certs succeed,enable auto renew..."
@@ -624,90 +658,227 @@ ssl_cert_issue() {
     if [ $? -ne 0 ]; then
         LOGE "auto renew failed, certs details:"
         ls -lah cert/*
-        chmod 755 $certPath/*
+        secure_cert_files "$certPath"
         exit 1
     else
         LOGI "auto renew succeed, certs details:"
         ls -lah cert/*
-        chmod 755 $certPath/*
+        secure_cert_files "$certPath"
     fi
 }
 
 ssl_cert_issue_CF() {
     echo -E ""
     LOGD "******Instructions for use******"
-    LOGI "This Acme script requires the following data:"
-    LOGI "1.Cloudflare Registered e-mail"
-    LOGI "2.Cloudflare Global API Key"
-    LOGI "3.The domain name that has been resolved dns to the current server by Cloudflare"
-    LOGI "4.The script applies for a certificate. The default installation path is /root/cert "
-    confirm "Confirmed?[y/n]" "y"
-    if [ $? -eq 0 ]; then
-        # check for acme.sh first
-        if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
-            echo "acme.sh could not be found. we will install it"
-            install_acme
-            if [ $? -ne 0 ]; then
-                LOGE "install acme failed, please check logs"
-                exit 1
+    echo "1) New certificate from Cloudflare"
+    echo "2) Force renew existing Certificates"
+    echo "3) Back to Menu"
+    read -p "Enter your choice [1-3]: " choice
+
+    certPath="/root/cert-CF"
+
+    case $choice in
+        1|2)
+            force_flag=""
+            if [ "$choice" -eq 2 ]; then
+                force_flag="--force"
+                echo "Forcing SSL certificate reissuance..."
+            else
+                echo "Starting SSL certificate issuance..."
             fi
-        fi
-        CF_Domain=""
-        CF_GlobalKey=""
-        CF_AccountEmail=""
-        certPath=/root/cert
-        if [ ! -d "$certPath" ]; then
-            mkdir $certPath
-        else
-            rm -rf $certPath
-            mkdir $certPath
-        fi
-        LOGD "Please set a domain name:"
-        read -p "Input your domain here:" CF_Domain
-        LOGD "Your domain name is set to:${CF_Domain}"
-        LOGD "Please set the API key:"
-        read -p "Input your key here:" CF_GlobalKey
-        LOGD "Your API key is:${CF_GlobalKey}"
-        LOGD "Please set up registered email:"
-        read -p "Input your email here:" CF_AccountEmail
-        LOGD "Your registered email address is:${CF_AccountEmail}"
-        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-        if [ $? -ne 0 ]; then
-            LOGE "Default CA, Lets'Encrypt fail, script exiting..."
-            exit 1
-        fi
-        export CF_Key="${CF_GlobalKey}"
-        export CF_Email=${CF_AccountEmail}
-        ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${CF_Domain} -d *.${CF_Domain} --log
-        if [ $? -ne 0 ]; then
-            LOGE "Certificate issuance failed, script exiting..."
-            exit 1
-        else
-            LOGI "Certificate issued Successfully, Installing..."
-        fi
-        ~/.acme.sh/acme.sh --installcert -d ${CF_Domain} -d *.${CF_Domain} --ca-file /root/cert/ca.cer \
-        --cert-file /root/cert/${CF_Domain}.cer --key-file /root/cert/${CF_Domain}.key \
-        --fullchain-file /root/cert/fullchain.cer
-        if [ $? -ne 0 ]; then
-            LOGE "Certificate installation failed, script exiting..."
-            exit 1
-        else
-            LOGI "Certificate installed Successfully,Turning on automatic updates..."
-        fi
-        ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-        if [ $? -ne 0 ]; then
-            LOGE "Auto update setup Failed, script exiting..."
-            ls -lah cert
-            chmod 755 $certPath
-            exit 1
-        else
-            LOGI "The certificate is installed and auto-renewal is turned on, Specific information is as follows"
-            ls -lah cert
-            chmod 755 $certPath
-        fi
+            
+            LOGD "******Instructions for use******"
+            LOGI "This Acme script requires the following data:"
+            LOGI "1.Cloudflare credentials, either of:"
+            LOGI "   a) An API Token scoped to Zone:DNS:Edit (recommended)"
+            LOGI "   b) The account e-mail and the Global API Key (full account access)"
+            LOGI "2.The domain name that has been resolved DNS to the current server by Cloudflare"
+            LOGI "3.The script applies for a certificate. The default installation path is /root/cert "
+            confirm "Confirmed?[y/n]" "y"
+            if [ $? -eq 0 ]; then
+                if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
+                    echo "acme.sh could not be found. Installing..."
+                    install_acme
+                    if [ $? -ne 0 ]; then
+                        LOGE "Install acme failed, please check logs"
+                        exit 1
+                    fi
+                fi
+
+                CF_Domain=""
+                if [ ! -d "$certPath" ]; then
+                    mkdir -p $certPath
+                else
+                    rm -rf $certPath
+                    mkdir -p $certPath
+                fi
+
+                LOGD "Please set a domain name:"
+                read -p "Input your domain here: " CF_Domain
+                LOGD "Your domain name is set to: ${CF_Domain}"
+
+                CF_Token=""
+                CF_Account_ID=""
+                CF_GlobalKey=""
+                CF_AccountEmail=""
+                LOGD "Choose the Cloudflare authentication method:"
+                echo -e "${green}\t1.${plain} API Token, scoped to Zone:DNS:Edit (*recommended*)"
+                echo -e "${green}\t2.${plain} Global API Key + account e-mail (full account access)"
+                read -p "Enter your choice [1-2, default 1]: " cf_auth
+                cf_auth=${cf_auth:-1}
+
+                if [[ "${cf_auth}" == "2" ]]; then
+                    LOGD "Please set the Global API Key:"
+                    read -r -s -p "Input your key here: " CF_GlobalKey
+                    echo ""
+                    if [[ -z "${CF_GlobalKey}" ]]; then
+                        LOGE "Global API Key cannot be empty, script exiting..."
+                        exit 1
+                    fi
+
+                    LOGD "Please set up registered email:"
+                    read -p "Input your email here: " CF_AccountEmail
+                    if [[ -z "${CF_AccountEmail}" ]]; then
+                        LOGE "Registered email cannot be empty, script exiting..."
+                        exit 1
+                    fi
+                    LOGD "Your registered email address is: ${CF_AccountEmail}"
+                else
+                    LOGD "Please set the API Token:"
+                    read -r -s -p "Input your token here: " CF_Token
+                    echo ""
+                    if [[ -z "${CF_Token}" ]]; then
+                        LOGE "API Token cannot be empty, script exiting..."
+                        exit 1
+                    fi
+
+                    LOGD "Please set the Account ID (optional, press enter to skip):"
+                    read -p "Input your account id here: " CF_Account_ID
+                fi
+
+                ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+                if [ $? -ne 0 ]; then
+                    LOGE "Default CA, Let's Encrypt failed, script exiting..."
+                    exit 1
+                fi
+
+                # Export only the chosen pair; a leftover of the other method in
+                # the environment would make acme.sh pick the wrong credentials.
+                if [[ "${cf_auth}" == "2" ]]; then
+                    unset CF_Token CF_Account_ID
+                    export CF_Key="${CF_GlobalKey}"
+                    export CF_Email="${CF_AccountEmail}"
+                else
+                    unset CF_Key CF_Email
+                    export CF_Token="${CF_Token}"
+                    if [[ -n "${CF_Account_ID}" ]]; then
+                        export CF_Account_ID="${CF_Account_ID}"
+                    else
+                        unset CF_Account_ID
+                    fi
+                fi
+
+                ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${CF_Domain} -d *.${CF_Domain} $force_flag --log
+                if [ $? -ne 0 ]; then
+                    LOGE "Certificate issuance failed, script exiting..."
+                    exit 1
+                else
+                    LOGI "Certificate issued Successfully, Installing..."
+                fi
+
+                mkdir -p ${certPath}/${CF_Domain}
+                if [ $? -ne 0 ]; then
+                    LOGE "Failed to create directory: ${certPath}/${CF_Domain}"
+                    exit 1
+                fi
+
+                ~/.acme.sh/acme.sh --installcert -d ${CF_Domain} -d *.${CF_Domain} \
+                    --fullchain-file ${certPath}/${CF_Domain}/fullchain.pem \
+                    --key-file ${certPath}/${CF_Domain}/privkey.pem
+
+                if [ $? -ne 0 ]; then
+                    LOGE "Certificate installation failed, script exiting..."
+                    exit 1
+                else
+                    LOGI "Certificate installed Successfully, Turning on automatic updates..."
+                fi
+
+                ~/.acme.sh/acme.sh --upgrade --auto-upgrade
+                if [ $? -ne 0 ]; then
+                    LOGE "Auto update setup failed, script exiting..."
+                    exit 1
+                else
+                    LOGI "The certificate is installed and auto-renewal is turned on."
+                    ls -lah ${certPath}/${CF_Domain}
+                    secure_cert_files "${certPath}/${CF_Domain}"
+                fi
+            fi
+            show_menu
+            ;;
+        3)
+            echo "Exiting..."
+            show_menu
+            ;;
+        *)
+            echo "Invalid choice, please select again."
+            show_menu
+            ;;
+    esac
+}
+
+generate_self_signed_cert() {
+    cert_dir="/etc/sing-box"
+    mkdir -p "$cert_dir"
+    LOGI "Choose certificate type:"
+    echo -e "${green}\t1.${plain} Ed25519 (*recommended*)"
+    echo -e "${green}\t2.${plain} RSA 2048"
+    echo -e "${green}\t3.${plain} RSA 4096"
+    echo -e "${green}\t4.${plain} ECDSA prime256v1"
+    echo -e "${green}\t5.${plain} ECDSA secp384r1"
+    read -p "Enter your choice [1-5, default 1]: " cert_type
+    cert_type=${cert_type:-1}
+
+    case "$cert_type" in
+        1)
+            algo="ed25519"
+            key_opt="-newkey ed25519"
+            ;;
+        2)
+            algo="rsa"
+            key_opt="-newkey rsa:2048"
+            ;;
+        3)
+            algo="rsa"
+            key_opt="-newkey rsa:4096"
+            ;;
+        4)
+            algo="ecdsa"
+            key_opt="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1"
+            ;;
+        5)
+            algo="ecdsa"
+            key_opt="-newkey ec -pkeyopt ec_paramgen_curve:secp384r1"
+            ;;
+        *)
+            algo="ed25519"
+            key_opt="-newkey ed25519"
+            ;;
+    esac
+
+    LOGI "Generating self-signed certificate ($algo)..."
+    sudo openssl req -x509 -nodes -days 3650 $key_opt \
+        -keyout "${cert_dir}/self.key" \
+        -out "${cert_dir}/self.crt" \
+        -subj "/CN=myserver"
+    if [[ $? -eq 0 ]]; then
+        sudo chmod 600 "${cert_dir}/self."*
+        LOGI "Self-signed certificate generated successfully!"
+        LOGI "Certificate path: ${cert_dir}/self.crt"
+        LOGI "Key path: ${cert_dir}/self.key"
     else
-        show_menu
+        LOGE "Failed to generate self-signed certificate."
     fi
+    before_show_menu
 }
 
 show_usage() {
@@ -715,10 +886,10 @@ show_usage() {
     echo -e "------------------------------------------"
     echo -e "SUBCOMMANDS:" 
     echo -e "s-ui              - Admin Management Script"
-    echo -e "s-ui start        - Start s-ui and sing-box"
-    echo -e "s-ui stop         - Stop s-ui and sing-box"
-    echo -e "s-ui restart      - Restart s-ui and sing-box"
-    echo -e "s-ui status       - Current Status of s-ui and sing-box"
+    echo -e "s-ui start        - Start s-ui"
+    echo -e "s-ui stop         - Stop s-ui"
+    echo -e "s-ui restart      - Restart s-ui"
+    echo -e "s-ui status       - Current Status of s-ui"
     echo -e "s-ui enable       - Enable Autostart on OS Startup"
     echo -e "s-ui disable      - Disable Autostart on OS Startup"
     echo -e "s-ui log          - Check s-ui Logs"
@@ -756,22 +927,13 @@ show_menu() {
   ${green}16.${plain} S-UI Enable Autostart
   ${green}17.${plain} S-UI Disable Autostart
 ————————————————————————————————
-  ${green}18.${plain} Sing-Box Start
-  ${green}19.${plain} Sing-Box Stop
-  ${green}20.${plain} Sing-Box Restart
-  ${green}21.${plain} Sing-Box Check State
-  ${green}22.${plain} Sing-Box Check Logs
-  ${green}23.${plain} Sing-Box Enable Autostart
-  ${green}24.${plain} Sing-Box Disable Autostart
-————————————————————————————————
-  ${green}25.${plain} Enable or Disable BBR
-  ${green}26.${plain} SSL Certificate Management
-  ${green}27.${plain} Cloudflare SSL Certificate
+  ${green}18.${plain} Enable or Disable BBR
+  ${green}19.${plain} SSL Certificate Management
+  ${green}20.${plain} Cloudflare SSL Certificate
 ————————————————————————————————
  "
     show_status s-ui
-    show_status sing-box
-    echo && read -p "Please enter your selection [0-27]: " num
+    echo && read -p "Please enter your selection [0-20]: " num
 
     case "${num}" in
     0)
@@ -829,37 +991,16 @@ show_menu() {
         check_install && disable s-ui
         ;;
     18)
-        check_install && start sing-box
-        ;;
-    19)
-        check_install && stop sing-box
-        ;;
-    20)
-        check_install && restart sing-box
-        ;;
-    21)
-        check_install && status sing-box
-        ;;
-    22)
-        check_install && show_log sing-box
-        ;;
-    23)
-        check_install && enable sing-box
-        ;;
-    24)
-        check_install && disable sing-box
-        ;;
-    25)
         bbr_menu
         ;;
-    26)
+    19)
         ssl_cert_issue_main
         ;;
-    27)
+    20)
         ssl_cert_issue_CF
         ;;
     *)
-        LOGE "Please enter the correct number [0-27]"
+        LOGE "Please enter the correct number [0-20]"
         ;;
     esac
 }
@@ -867,22 +1008,22 @@ show_menu() {
 if [[ $# > 0 ]]; then
     case $1 in
     "start")
-        check_install 0 && start s-ui 0 && start sing-box 0
+        check_install 0 && start s-ui 0
         ;;
     "stop")
-        check_install 0 && stop s-ui 0 && stop sing-box 0
+        check_install 0 && stop s-ui 0
         ;;
     "restart")
-        check_install 0 && restart s-ui 0 && restart sing-box 0
+        check_install 0 && restart s-ui 0
         ;;
     "status")
         check_install 0 && status 0
         ;;
     "enable")
-        check_install 0 && enable s-ui 0 && enable sing-box 0
+        check_install 0 && enable s-ui 0
         ;;
     "disable")
-        check_install 0 && disable s-ui 0 && disable sing-box 0
+        check_install 0 && disable s-ui 0
         ;;
     "log")
         check_install 0 && show_log s-ui 0
